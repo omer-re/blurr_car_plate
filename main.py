@@ -3,7 +3,7 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 from moviepy.editor import VideoFileClip
 from tqdm import tqdm
-
+import imutils
 
 # Function to remove audio from a video
 def remove_audio(input_video_path, output_video_path):
@@ -43,38 +43,57 @@ def cluster_bounding_boxes(boxes, eps=50, min_samples=1):
     return clustered_boxes
 
 
-# Function to apply flood-fill and watershed segmentation
-def refine_license_plate_region(frame, mask, x, y, w, h):
-    # Create a marker image for watershed
-    markers = np.zeros_like(mask, dtype=np.int32)
+# Function to reduce color resolution
+def quantize_colors(frame, k=24):
+    """Reduces the number of colors in the image using k-means clustering."""
+    # Reshape the image to a 2D array of pixels
+    pixel_values = frame.reshape((-1, 3))
+    pixel_values = np.float32(pixel_values)
 
-    # Set the background region to 1
-    cv2.rectangle(markers, (0, 0), (frame.shape[1], frame.shape[0]), 1, thickness=-1)
+    # Apply k-means clustering
+    _, labels, centers = cv2.kmeans(
+        pixel_values, k, None,
+        criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0),
+        attempts=10, flags=cv2.KMEANS_RANDOM_CENTERS
+    )
 
-    # Set the license plate region to a unique value (e.g., 2)
-    cv2.rectangle(markers, (x, y), (x + w, y + h), 2, thickness=-1)
+    # Convert centers to integers and reshape the image back
+    centers = np.uint8(centers)
+    quantized_frame = centers[labels.flatten()]
+    quantized_frame = quantized_frame.reshape(frame.shape)
 
-    # Convert the frame to grayscale for watershed input
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    # Apply watershed segmentation
-    cv2.watershed(frame, markers)
-
-    # Create a mask for the license plate region after segmentation
-    refined_mask = (markers == 2).astype(np.uint8) * 255
-    return refined_mask
+    return quantized_frame
 
 
-# Function to detect and blur license plates
+# Function to detect license plates based on yellow color
+def detect_license_plates(frame):
+    # Reduce color space resolution
+    quantized_frame = quantize_colors(frame, k=32)
+
+    # Convert to HSL for color segmentation
+    hsl_frame = cv2.cvtColor(quantized_frame, cv2.COLOR_BGR2HLS)
+
+    # Define HSL range for yellow license plates
+    lower_yellow = np.array([15, 100, 100])  # Adjusted for quantized yellow
+    upper_yellow = np.array([35, 255, 255])
+
+    # Create a mask for yellow regions
+    yellow_mask = cv2.inRange(hsl_frame, lower_yellow, upper_yellow)
+
+    # Apply morphological operations to clean the mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, kernel)
+    yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN, kernel)
+
+    return yellow_mask
+
+
+# Updated function to blur license plates by replacing them with average color
 def blur_license_plate(input_video_path, output_video_path):
     cap = cv2.VideoCapture(input_video_path)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_video_path, fourcc, int(cap.get(cv2.CAP_PROP_FPS)),
                           (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))))
-
-    # Define the color range for the license plate
-    lower_color = np.array([20, 50, 50])  # Lower bound of yellow-orange in HSL
-    upper_color = np.array([40, 255, 255])  # Upper bound of yellow-orange in HSL
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     pbar = tqdm(total=total_frames, desc="Processing Frames")
@@ -84,27 +103,19 @@ def blur_license_plate(input_video_path, output_video_path):
         if not ret:
             break
 
-        # Convert the frame to HSL
-        hsl_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
+        # Detect license plates
+        yellow_mask = detect_license_plates(frame)
 
-        # Mask the license plate based on color
-        mask = cv2.inRange(hsl_frame, lower_color, upper_color)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Apply mask to original frame and replace masked area with average color
+        if np.any(yellow_mask):  # Check if mask has any detected regions
+            # Compute average color in the masked region
+            masked_area = cv2.bitwise_and(frame, frame, mask=yellow_mask)
+            average_color = cv2.mean(masked_area, mask=yellow_mask)[:3]
 
-        # Extract bounding rectangles
-        boxes = [cv2.boundingRect(contour) for contour in contours if cv2.contourArea(contour) > 50]
-
-        # Cluster and merge bounding boxes
-        clustered_boxes = cluster_bounding_boxes(boxes, eps=60, min_samples=1)
-
-        for (x, y, w, h) in clustered_boxes:
-            # Refine the mask using flood-fill and watershed
-            refined_mask = refine_license_plate_region(frame, mask, x, y, w, h)
-
-            # Blur the refined license plate region
-            blur_frame = frame.copy()
-            blur_frame[refined_mask == 255] = cv2.GaussianBlur(frame[refined_mask == 255], (51, 51), 30)
-            frame[refined_mask == 255] = blur_frame[refined_mask == 255]
+            # Create an average color image to blend with the masked region
+            average_color_image = np.full_like(frame, average_color, dtype=np.uint8)
+            frame = cv2.bitwise_and(frame, frame, mask=cv2.bitwise_not(yellow_mask))  # Remove mask area
+            frame += cv2.bitwise_and(average_color_image, average_color_image, mask=yellow_mask)  # Add averaged color
 
         out.write(frame)
         pbar.update(1)
@@ -112,8 +123,6 @@ def blur_license_plate(input_video_path, output_video_path):
     pbar.close()
     cap.release()
     out.release()
-
-
 
 
 def main():
