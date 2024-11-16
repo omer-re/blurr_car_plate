@@ -1,123 +1,61 @@
+import subprocess
 import cv2
 import numpy as np
-from sklearn.cluster import DBSCAN
-from moviepy.editor import VideoFileClip
 from tqdm import tqdm
-import imutils
+from collections import deque
 
-# Function to remove audio from a video
-def remove_audio(input_video_path, output_video_path):
-    video = VideoFileClip(input_video_path)
-    video_no_audio = video.without_audio()
-    video_no_audio.write_videofile(output_video_path, codec="libx264", audio=False)
+# Temporal smoothing constants
+TEMPORAL_SMOOTHING_WEIGHT = 1  # Adjust this between 0.0 (no smoothing) to 1.0 (high smoothing)
 
 
-# Function to cluster bounding boxes
-def cluster_bounding_boxes(boxes, eps=50, min_samples=1):
-    if not boxes:
-        return []
-
-    # Convert bounding boxes to (x_center, y_center) format for clustering
-    centers = np.array([(x + w // 2, y + h // 2) for x, y, w, h in boxes])
-
-    # Apply DBSCAN clustering
-    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(centers)
-
-    # Group boxes by cluster labels
-    clustered_boxes = []
-    for cluster_id in set(clustering.labels_):
-        if cluster_id == -1:  # Noise points
-            continue
-
-        cluster_indices = np.where(clustering.labels_ == cluster_id)[0]
-        cluster_boxes = [boxes[i] for i in cluster_indices]
-
-        # Merge all boxes in the cluster into one bounding box
-        x_min = min([x for x, _, _, _ in cluster_boxes])
-        y_min = min([y for _, y, _, _ in cluster_boxes])
-        x_max = max([x + w for x, _, w, _ in cluster_boxes])
-        y_max = max([y + h for _, y, _, h in cluster_boxes])
-
-        clustered_boxes.append((x_min, y_min, x_max - x_min, y_max - y_min))
-
-    return clustered_boxes
+def run_ffmpeg(command):
+    """Helper function to run an FFmpeg command."""
+    subprocess.run(command, shell=True, check=True)
 
 
-# Function to reduce color resolution
-def quantize_colors(frame, k=24):
+def downscale_video(input_video, downscaled_video, scale_factor=0.5):
+    """Downscale the video using FFmpeg."""
+    print("Downscaling video...")
+    run_ffmpeg(f"ffmpeg -i {input_video} -vf scale=iw*{scale_factor}:ih*{scale_factor} {downscaled_video}")
+
+
+def quantize_colors(frame, k=8):
     """Reduces the number of colors in the image using k-means clustering."""
-    # Reshape the image to a 2D array of pixels
     pixel_values = frame.reshape((-1, 3))
     pixel_values = np.float32(pixel_values)
 
-    # Apply k-means clustering
     _, labels, centers = cv2.kmeans(
         pixel_values, k, None,
         criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0),
         attempts=10, flags=cv2.KMEANS_RANDOM_CENTERS
     )
 
-    # Convert centers to integers and reshape the image back
     centers = np.uint8(centers)
     quantized_frame = centers[labels.flatten()]
-    quantized_frame = quantized_frame.reshape(frame.shape)
-
-    return quantized_frame
+    return quantized_frame.reshape(frame.shape)
 
 
-# Function to detect license plates based on yellow color
-def detect_license_plates(frame):
-    # Reduce color space resolution
-    quantized_frame = quantize_colors(frame, k=32)
-
-    # Convert to HSL for color segmentation
-    hsl_frame = cv2.cvtColor(quantized_frame, cv2.COLOR_BGR2HLS)
-
-    # Define HSL range for yellow license plates
-    lower_yellow = np.array([15, 100, 100])  # Adjusted for quantized yellow
-    upper_yellow = np.array([35, 255, 255])
-
-    # Create a mask for yellow regions
-    yellow_mask = cv2.inRange(hsl_frame, lower_yellow, upper_yellow)
-
-    # Apply morphological operations to clean the mask
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, kernel)
-    yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN, kernel)
-
-    return yellow_mask
-
-
-# Updated function to blur license plates by replacing them with average color
-def blur_license_plate(input_video_path, output_video_path):
-    cap = cv2.VideoCapture(input_video_path)
+def quantize_video(input_video, quantized_video, k=8):
+    """Quantize the downscaled video and save the result."""
+    cap = cv2.VideoCapture(input_video)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_video_path, fourcc, int(cap.get(cv2.CAP_PROP_FPS)),
-                          (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))))
+    out = cv2.VideoWriter(quantized_video, fourcc, fps, (width, height))
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    pbar = tqdm(total=total_frames, desc="Processing Frames")
+    pbar = tqdm(total=total_frames, desc="Quantizing Video")
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Detect license plates
-        yellow_mask = detect_license_plates(frame)
+        # Apply color quantization
+        quantized_frame = quantize_colors(frame, k=k)
+        out.write(quantized_frame)
 
-        # Apply mask to original frame and replace masked area with average color
-        if np.any(yellow_mask):  # Check if mask has any detected regions
-            # Compute average color in the masked region
-            masked_area = cv2.bitwise_and(frame, frame, mask=yellow_mask)
-            average_color = cv2.mean(masked_area, mask=yellow_mask)[:3]
-
-            # Create an average color image to blend with the masked region
-            average_color_image = np.full_like(frame, average_color, dtype=np.uint8)
-            frame = cv2.bitwise_and(frame, frame, mask=cv2.bitwise_not(yellow_mask))  # Remove mask area
-            frame += cv2.bitwise_and(average_color_image, average_color_image, mask=yellow_mask)  # Add averaged color
-
-        out.write(frame)
         pbar.update(1)
 
     pbar.close()
@@ -125,18 +63,208 @@ def blur_license_plate(input_video_path, output_video_path):
     out.release()
 
 
+def remove_isolated_segments(mask, min_size=500):
+    """Remove small isolated segments from the mask."""
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    clean_mask = np.zeros_like(mask)
+
+    # Iterate through connected components and keep only large segments
+    for i in range(1, num_labels):  # Skip background
+        if stats[i, cv2.CC_STAT_AREA] >= min_size:
+            clean_mask[labels == i] = 255
+
+    return clean_mask
+
+
+def create_mask_from_quantized(quantized_video, mask_video, original_resolution):
+    """Create a mask for yellow areas from the quantized video."""
+    cap = cv2.VideoCapture(quantized_video)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    width, height = original_resolution
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(mask_video, fourcc, fps, (width, height))
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    pbar = tqdm(total=total_frames, desc="Creating Mask")
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Convert to HSL and create mask for yellow
+        hsl_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
+        lower_yellow = np.array([15, 100, 100])
+        upper_yellow = np.array([35, 255, 255])
+        mask = cv2.inRange(hsl_frame, lower_yellow, upper_yellow)
+
+        # Remove isolated segments
+        mask = remove_isolated_segments(mask)
+
+        # Upscale mask to original resolution
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)  # Convert to BGR to save as video
+        out.write(mask_bgr)
+
+        pbar.update(1)
+
+    pbar.close()
+    cap.release()
+    out.release()
+
+
+WINDOW_SIZE = 10  # Number of frames for smoothing
+
+def smooth_mask_sliding_window(current_mask, mask_history):
+    """
+    Smooth the current mask using a sliding window approach.
+    Args:
+        current_mask (numpy.ndarray): The current binary mask.
+        mask_history (deque): A queue containing the last `N` masks.
+    Returns:
+        numpy.ndarray: The smoothed mask.
+    """
+    mask_history.append(current_mask.astype(np.float32))
+    if len(mask_history) > WINDOW_SIZE:
+        mask_history.popleft()
+    # Compute the average of the masks in the history
+    smoothed_mask = np.mean(mask_history, axis=0)
+    return smoothed_mask, mask_history
+
+
+def smooth_mask(current_mask, previous_mask):
+    """
+    Smooth the current mask using a weighted average with the previous mask.
+    Args:
+        current_mask (numpy.ndarray): The current binary mask.
+        previous_mask (numpy.ndarray): The previous smoothed mask.
+    Returns:
+        numpy.ndarray: The smoothed mask.
+    """
+    # Ensure both masks have the same data type
+    current_mask = current_mask.astype(np.float32)
+    previous_mask = previous_mask.astype(np.float32)
+
+    smoothed_mask = cv2.addWeighted(
+        current_mask,
+        TEMPORAL_SMOOTHING_WEIGHT,
+        previous_mask,
+        1 - TEMPORAL_SMOOTHING_WEIGHT,
+        0
+    )
+
+    # Convert the smoothed mask back to the original type (if needed)
+    return smoothed_mask.astype(np.uint8)
+
+
+def blur_license_plate_with_polygon_and_smoothing(input_video, mask_video, output_video):
+    """Blur license plates using the mask and fill them with forced 4-point polygons, with temporal smoothing."""
+    cap_original = cv2.VideoCapture(input_video)
+    cap_mask = cv2.VideoCapture(mask_video)
+    previous_mask = None  # Initialize previous_mask
+    # Verify input video properties
+    fps = int(cap_original.get(cv2.CAP_PROP_FPS))
+    width = int(cap_original.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap_original.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"Input video properties - FPS: {fps}, Width: {width}, Height: {height}")
+
+    if fps == 0 or width == 0 or height == 0:
+        print("Error: Invalid video properties. Cannot proceed.")
+        return
+
+    # Initialize VideoWriter
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
+    if not out.isOpened():
+        print("Error: VideoWriter initialization failed!")
+        return
+
+    total_frames = int(cap_original.get(cv2.CAP_PROP_FRAME_COUNT))
+    pbar = tqdm(total=total_frames, desc="Filling Mask with Temporal Smoothing")
+
+    # Initialize variables for temporal smoothing
+    mask_history = deque(maxlen=WINDOW_SIZE)
+
+    while cap_original.isOpened() and cap_mask.isOpened():
+        ret_orig, frame_original = cap_original.read()
+        ret_mask, frame_mask = cap_mask.read()
+        if not ret_orig or not ret_mask:
+            print("Error: Could not read frames from input or mask videos.")
+            break
+
+        print("Processing frame...")
+
+        # Convert mask to grayscale
+        mask_gray = cv2.cvtColor(frame_mask, cv2.COLOR_BGR2GRAY)
+        _, binary_mask = cv2.threshold(mask_gray, 1, 255, cv2.THRESH_BINARY)
+
+        # Apply sliding window smoothing
+        smoothed_mask, mask_history = smooth_mask_sliding_window(binary_mask, mask_history)
+        smoothed_mask = (smoothed_mask > 127).astype(np.uint8) * 255  # Threshold for binary output
+
+        # Apply additional smoothing using cv2.addWeighted
+        if previous_mask is not None:
+            smoothed_mask = cv2.addWeighted(
+                smoothed_mask, TEMPORAL_SMOOTHING_WEIGHT,
+                previous_mask, 1 - TEMPORAL_SMOOTHING_WEIGHT,
+                0
+            )
+
+        # Update the previous_mask for the next frame
+        previous_mask = smoothed_mask
+
+        # Find contours
+        contours, _ = cv2.findContours(smoothed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            # Get the minimum area rectangle
+            rect = cv2.minAreaRect(contour)
+            box = cv2.boxPoints(rect)  # Get the 4 points of the rectangle
+            box = np.int0(box)  # Convert to integer coordinates
+
+            # Expand the bounding box slightly
+            expansion_ratio = 0.1  # 10% expansion
+            box_center = np.mean(box, axis=0)
+            box = np.array([(point - box_center) * (1 + expansion_ratio) + box_center for point in box], dtype=np.int0)
+
+            # Draw the 4-point polygon and fill with pink
+            cv2.fillPoly(frame_original, [box], (0, 180, 238))  # RGB(238, 180, 0) as BGR in OpenCV
+
+        out.write(frame_original)
+        pbar.update(1)
+
+    pbar.close()
+    cap_original.release()
+    cap_mask.release()
+    out.release()
+    print("Processing complete.")
+
+
+
 def main():
-    input_path = r"C:\Users\omerr\Downloads\prius_album\20241116_104132.mp4"
-    no_audio_path = "car_video_no_audio.mp4"
-    output_path = "car_video_blurred.mp4"
+    input_path = r"G:\My Drive\OMER_PERSONAL\PycharmProjects\blurr_car_plate\car_video_no_audio.mp4"
+    downscaled_path = r"downscaled.mp4"
+    quantized_path = r"quantized.mp4"
+    mask_path = r"mask.mp4"
+    output_path = r"output_with_smoothing.mp4"
 
-    # Step 1: Remove audio
-    print("Removing audio from the video...")
-    # remove_audio(input_path, no_audio_path)
+    # Verify input file exists
+    import os
+    if not os.path.exists(input_path):
+        print(f"Error: File not found at {input_path}")
+        return
 
-    # Step 2: Blur license plates
-    print("Blurring license plates in the video...")
-    blur_license_plate(no_audio_path, output_path)
+    # Step 1: Downscale the video
+    # downscale_video(input_path, downscaled_path, scale_factor=0.5)
+
+    # Step 2: Quantize the downscaled video
+    # quantize_video(downscaled_path, quantized_path, k=32)
+
+    # Step 3: Create a mask from the quantized video
+    original_resolution = (1920, 1080)  # Replace with your original resolution
+    create_mask_from_quantized(quantized_path, mask_path, original_resolution)
+
+    # Step 4: Blur license plates using polygons with smoothing
+    blur_license_plate_with_polygon_and_smoothing(input_path, mask_path, output_path)
 
     print(f"Processing complete. Output saved as {output_path}")
 
